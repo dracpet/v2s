@@ -137,6 +137,13 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     private var speechRecognizer: SFSpeechRecognizer?
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
+    /// Consecutive recognition-task failures, reset on any successful result.
+    /// Drives exponential backoff + honest error surfacing (quota storms must
+    /// not spin at hundreds of failing requests per minute).
+    /// Cloud ASR engine (Groq-compatible chunked upload). When non-nil, audio
+    /// routes here instead of Apple's speech recognizers.
+    private var cloudASREngine: CloudASREngine?
+    private var consecutiveRecognitionFailures = 0
     /// Incremented on every restart. Handlers capture their generation at creation time
     /// and discard callbacks that arrive after a newer generation has started.
     private var recognitionGeneration: Int = 0
@@ -229,6 +236,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         interfaceLanguageID: String,
         modeConfig: ModeConfig = .balanced,
         contextualStrings: [String] = [],
+        cloudASR: CloudASRSettings = .disabled,
         transcriptHandler: @escaping @MainActor (RecognizedSentence) -> Void,
         partialHandler: @escaping @MainActor (DraftSegment?) -> Void,
         errorHandler: @escaping @MainActor (String) -> Void
@@ -244,10 +252,31 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             recentCommittedSentenceHistory.removeAll()
         }
 
-        try await requestRequiredPermissions(for: source)
-        if try await configureModernSpeechRecognizer(localeIdentifier: localeIdentifier) == false {
+        if cloudASR.enabled {
+            let engine = CloudASREngine(
+                settings: cloudASR,
+                localeIdentifier: localeIdentifier,
+                contextualHints: contextualStrings,
+                emitSentence: { [weak self] text in
+                    self?.transcriptHandler?(RecognizedSentence(text: text))
+                },
+                reportFatal: { [weak self] message in
+                    self?.errorHandler?(message)
+                }
+            )
             try await runOnCaptureQueue {
-                try self.configureSpeechRecognizer(localeIdentifier: localeIdentifier)
+                self.cloudASREngine = engine
+            }
+            // Speech recognition permission/models not needed for cloud ASR.
+            try await requestRequiredPermissions(for: source, skipSpeech: true)
+        } else {
+        try await requestRequiredPermissions(for: source)
+        }
+        if cloudASR.enabled == false {
+            if try await configureModernSpeechRecognizer(localeIdentifier: localeIdentifier) == false {
+                try await runOnCaptureQueue {
+                    try self.configureSpeechRecognizer(localeIdentifier: localeIdentifier)
+                }
             }
         }
 
@@ -273,6 +302,8 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     }
 
     private func stopOnCaptureQueue() {
+        cloudASREngine?.stop()
+        cloudASREngine = nil
         cancelSilenceTimer()
         cancelVADSilenceTimer()
 
@@ -303,8 +334,8 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         }
     }
 
-    private func requestRequiredPermissions(for source: InputSource) async throws {
-        let speechStatus = SFSpeechRecognizer.authorizationStatus()
+    private func requestRequiredPermissions(for source: InputSource, skipSpeech: Bool = false) async throws {
+        let speechStatus = skipSpeech ? .authorized : SFSpeechRecognizer.authorizationStatus()
 
         switch speechStatus {
         case .authorized:
@@ -552,6 +583,11 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
 
     private func makeRecognitionRequest() -> SFSpeechAudioBufferRecognitionRequest {
         let request = SFSpeechAudioBufferRecognitionRequest()
+        // On-device where the locale supports it: avoids server quota entirely.
+        // (zh-Hans has no on-device model on Intel Macs → stays server-based.)
+        if speechRecognizer?.supportsOnDeviceRecognition == true {
+            request.requiresOnDeviceRecognition = true
+        }
         request.shouldReportPartialResults = true
         request.taskHint = .dictation
         request.addsPunctuation = true
@@ -802,6 +838,11 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             if vadResult.containsSpeechOnset {
                 cancelVADSilenceTimer()
             }
+        }
+
+        if let cloudASREngine {
+            cloudASREngine.ingest(processingBuffer)
+            return
         }
 
         if recognitionBackend == .speechAnalyzer {
@@ -1500,6 +1541,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     }
 
     private func processRecognitionResult(_ result: SFSpeechRecognitionResult) {
+        consecutiveRecognitionFailures = 0
         lastRecognitionResultTime = Date()
         let transcription = result.bestTranscription
         let segments = transcription.segments
@@ -1684,12 +1726,34 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
 
                 if isCancellation { return }
 
-                // For any other error, attempt a silent restart so recording continues.
-                // If the recogniser is truly unavailable the restart guard will bail out.
+                // For any other error, restart with exponential backoff — a
+                // persistent failure (e.g. server-side speech quota exhausted,
+                // kAFAssistantErrorDomain 203) must not spin at full rate.
+                // After 5 consecutive failures (~60s), surface honestly instead
+                // of leaving the overlay on "waiting for audio" forever.
                 self?.captureQueue.async { [weak self] in
                     guard let self, self.speechRecognizer != nil,
                           self.recognitionGeneration == generation else { return }
-                    self.restartRecognitionTask()
+                    self.consecutiveRecognitionFailures += 1
+                    let failures = self.consecutiveRecognitionFailures
+                    // Server-side flaps (quota 203, service 209, transient 202) are
+                    // retry-forever with capped backoff — sessions must survive
+                    // Apple's throttling and resume when it lifts. Config-class
+                    // errors (permissions, unsupported locale) still escalate.
+                    let nsErr = error as NSError
+                    let isServerFlap = nsErr.domain == "kAFAssistantErrorDomain"
+                        && [202, 203, 209].contains(nsErr.code)
+                    if failures >= 5 && isServerFlap == false {
+                        let message = "Speech recognition keeps failing "
+                            + "(\(failures) attempts): \(error.localizedDescription)"
+                        Task { @MainActor [weak self] in self?.errorHandler?(message) }
+                        return
+                    }
+                    let delay = min(pow(2.0, Double(failures)), 30.0)
+                    self.captureQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                        guard let self, self.recognitionGeneration == generation else { return }
+                        self.restartRecognitionTask()
+                    }
                 }
                 return
             }
