@@ -15,6 +15,9 @@ private enum AppBuildInfo {
 @MainActor
 final class AppModel: ObservableObject {
     private let settingsStore: SettingsStore
+    private var slideContextService: SlideContextService?
+    private var slideContextCancellable: AnyCancellable?
+    private var sessionStateCancellable: AnyCancellable?
     private let sourceCatalogService: SourceCatalogService
     private let translationCoordinator = TranslationCoordinator()
     private let glossaryService = GlossaryService()
@@ -69,6 +72,23 @@ final class AppModel: ObservableObject {
         didSet {
             persistSettings()
             syncOverlayPreviewIfNeeded()
+        }
+    }
+
+    /// Cloud translation backend settings (DeepSeek-compatible). didSet syncs
+    /// the coordinator immediately so a running session picks up changes.
+    @Published var cloudTranslation: CloudTranslationSettings = .disabled {
+        didSet {
+            syncCloudTranslationSettings()
+            persistSettings()
+        }
+    }
+
+    /// Cloud ASR backend settings (Groq-compatible). Read at session start;
+    /// toggling mid-session takes effect on the next session.
+    @Published var cloudASR: CloudASRSettings = .disabled {
+        didSet {
+            persistSettings()
         }
     }
 
@@ -173,10 +193,10 @@ final class AppModel: ObservableObject {
         }
         self.selectedSourceIDs = initialSelectedSourceIDs
         self.sourceLanguageOverrides = settings.sourceLanguageOverrides.mapValues {
-            LanguageCatalog.supportedSpeechInputLanguageID(for: $0)
+            LanguageCatalog.supportedSpeechInputLanguageID(for: $0, cloudASREnabled: settings.cloudASR.enabled)
         }
         self.sourceOutputLanguageOverrides = settings.sourceOutputLanguageOverrides
-        self.inputLanguageID = LanguageCatalog.supportedSpeechInputLanguageID(for: settings.inputLanguageID)
+        self.inputLanguageID = LanguageCatalog.supportedSpeechInputLanguageID(for: settings.inputLanguageID, cloudASREnabled: settings.cloudASR.enabled)
         self.outputLanguageID = settings.outputLanguageID
         self.usesSystemInterfaceLanguage = settings.interfaceLanguageID == nil
         self.interfaceLanguageID = LanguageCatalog.preferredInterfaceLanguageID(
@@ -187,12 +207,33 @@ final class AppModel: ObservableObject {
         self.subtitleMode = settings.subtitleMode
         self.subtitleDisplayMode = settings.subtitleDisplayMode
         self.glossary = settings.glossary
+        self.cloudTranslation = settings.cloudTranslation
+        self.cloudASR = settings.cloudASR
         self.translationHostConfiguration = nil
         AppLocalization.updateEmbeddedBundleLocalizationLanguageID(self.interfaceLanguageID)
 
         translationCoordinator.onConfigurationChange = { [weak self] configuration in
             self?.translationHostConfiguration = configuration
         }
+        syncCloudTranslationSettings()
+
+        let slideService = SlideContextService(
+            bundleIDProvider: { [weak self] in
+                guard let source = self?.selectedSource,
+                      source.category == .application else { return nil }
+                return source.detail
+            },
+            settingsProvider: { [weak self] in self?.cloudTranslation ?? .disabled }
+        )
+        self.slideContextService = slideService
+        slideContextCancellable = slideService.$currentTerms
+            .sink { [weak self] terms in
+                self?.translationCoordinator.cloudSlideContext = terms
+            }
+        sessionStateCancellable = $sessionState
+            .sink { [weak slideService] state in
+                if state == .running { slideService?.start() } else { slideService?.stop() }
+            }
 
         isBootstrapping = false
         applyStatusMessage()
@@ -254,7 +295,7 @@ final class AppModel: ObservableObject {
 
     func setLanguageID(_ languageID: String, for source: InputSource) {
         var overrides = sourceLanguageOverrides
-        let normalizedLanguageID = LanguageCatalog.supportedSpeechInputLanguageID(for: languageID)
+        let normalizedLanguageID = LanguageCatalog.supportedSpeechInputLanguageID(for: languageID, cloudASREnabled: cloudASR.enabled)
         if normalizedLanguageID == inputLanguageID {
             overrides.removeValue(forKey: source.id)
         } else {
@@ -567,6 +608,7 @@ final class AppModel: ObservableObject {
                     interfaceLanguageID: resolvedInterfaceLanguageID,
                     modeConfig: config,
                     contextualStrings: recognitionHints,
+                    cloudASR: cloudASR,
                     transcriptHandler: { [weak self] sentence in
                         self?.enqueueRecognizedSentence(
                             sentence,
@@ -708,10 +750,18 @@ final class AppModel: ObservableObject {
             overlayStyle: overlayStyle,
             subtitleMode: subtitleMode,
             subtitleDisplayMode: subtitleDisplayMode,
-            glossary: glossary
+            glossary: glossary,
+            cloudTranslation: cloudTranslation,
+            cloudASR: cloudASR
         )
 
         settingsStore.save(settings)
+        syncCloudTranslationSettings()
+    }
+
+    private func syncCloudTranslationSettings() {
+        translationCoordinator.cloudSettings = cloudTranslation
+        translationCoordinator.cloudGlossary = glossary
     }
 
     private static func normalizedOverlayStyle(_ style: OverlayStyle) -> OverlayStyle {
@@ -845,7 +895,9 @@ final class AppModel: ObservableObject {
     }
 
     private var hasBlockingLanguageResourceStatuses: Bool {
-        languageResourceStatuses.contains(where: \.isError)
+        languageResourceStatuses.contains { status in
+            status.isError && (cloudTranslation.enabled == false || status.kind != .translation)
+        }
     }
 
     private func prepareSelectedLanguageResources(
@@ -855,7 +907,7 @@ final class AppModel: ObservableObject {
     ) async {
         var destinationsToOpen = Set<LanguageResourceSystemSettingsDestination>()
         await withTaskGroup(of: LanguageResourceSystemSettingsDestination?.self) { group in
-            for speechLanguageID in speechLanguageIDs {
+            for speechLanguageID in speechLanguageIDs where cloudASR.enabled == false {
                 group.addTask { [weak self] in
                     guard let self else {
                         return nil
@@ -865,7 +917,7 @@ final class AppModel: ObservableObject {
                 }
             }
 
-            for translationPair in translationPairs {
+            for translationPair in translationPairs where cloudTranslation.enabled == false {
                 group.addTask { [weak self] in
                     guard let self else {
                         return nil
@@ -899,7 +951,13 @@ final class AppModel: ObservableObject {
     private func prepareSpeechRecognitionResourceIfNeeded(
         for languageID: String
     ) async -> LanguageResourceSystemSettingsDestination? {
-        guard #available(macOS 26.0, *) else {
+        // 2026-08-22 patch: on Intel Macs the modern SpeechAnalyzer stack is
+        // entirely unavailable (SpeechTranscriber.isAvailable == false and
+        // AssetInventory reports .unsupported for every locale), so gating
+        // language preparation on modern assets blocks the working legacy
+        // SFSpeechRecognizer fallback. Only demand modern assets when the
+        // modern stack can actually run.
+        guard #available(macOS 26.0, *), SpeechTranscriber.isAvailable else {
             return nil
         }
 
@@ -1498,6 +1556,7 @@ final class AppModel: ObservableObject {
                 return
             }
 
+            let draftTranslationIsCloud = cloudTranslation.enabled
             let translated = await withTaskGroup(of: String?.self, returning: String?.self) { group in
                 group.addTask {
                     try? await self.translationCoordinator.translate(
@@ -1508,7 +1567,9 @@ final class AppModel: ObservableObject {
                 }
                 // Draft translation should feel live; drop stale work quickly.
                 group.addTask {
-                    try? await Task.sleep(nanoseconds: 700_000_000)
+                    // Cloud backends need ~1-3s; Apple on-device is fast.
+                    let timeoutNs: UInt64 = draftTranslationIsCloud ? 2_500_000_000 : 700_000_000
+                    try? await Task.sleep(nanoseconds: timeoutNs)
                     return nil
                 }
                 let result = await group.next() ?? nil
@@ -3087,6 +3148,16 @@ private final class TranslationCoordinator: ObservableObject {
 
     var onConfigurationChange: ((TranslationSession.Configuration?) -> Void)?
 
+    // MARK: Cloud translation backend (OpenAI-compatible, e.g. DeepSeek)
+    // When cloudSettings.enabled, translate()/prepareIfNeeded() bypass Apple's
+    // Translation framework entirely — no availability checks, no session runner.
+    var cloudSettings = CloudTranslationSettings.disabled
+    var cloudGlossary: [String: String] = [:]
+    /// Latest slide terms from SlideContextService (rolling multi-slide union).
+    var cloudSlideContext: String = "" 
+    private let cloudService = CloudTranslationService()
+    private var cloudHistory: [(source: String, target: String)] = []
+
     private(set) var configuration: TranslationSession.Configuration? {
         didSet {
             onConfigurationChange?(configuration)
@@ -3108,6 +3179,9 @@ private final class TranslationCoordinator: ObservableObject {
         to targetIdentifier: String
     ) async throws {
         guard sourceIdentifier != targetIdentifier else {
+            return
+        }
+        guard cloudSettings.enabled == false else {
             return
         }
 
@@ -3149,6 +3223,23 @@ private final class TranslationCoordinator: ObservableObject {
 
         guard sourceIdentifier != targetIdentifier else {
             return trimmedText
+        }
+
+        if cloudSettings.enabled {
+            let translated = try await cloudService.translate(
+                trimmedText,
+                from: sourceIdentifier,
+                to: targetIdentifier,
+                settings: cloudSettings,
+                glossary: cloudGlossary,
+                history: cloudHistory,
+                slideContext: cloudSlideContext
+            )
+            cloudHistory.append((source: trimmedText, target: translated))
+            if cloudHistory.count > 6 {
+                cloudHistory.removeFirst(cloudHistory.count - 6)
+            }
+            return translated
         }
 
         let pair = LanguagePair(source: sourceIdentifier, target: targetIdentifier)
@@ -3260,6 +3351,7 @@ private final class TranslationCoordinator: ObservableObject {
     }
 
     func reset() {
+        cloudHistory.removeAll()
         generation &+= 1
         cancelOutstandingOperations()
         currentPair = nil

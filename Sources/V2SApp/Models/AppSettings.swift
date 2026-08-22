@@ -12,6 +12,8 @@ struct AppSettings: Codable {
     var subtitleMode: SubtitleMode
     var subtitleDisplayMode: SubtitleDisplayMode
     var glossary: [String: String]
+    var cloudTranslation: CloudTranslationSettings
+    var cloudASR: CloudASRSettings
 
     static let `default` = AppSettings(
         selectedSourceID: nil,
@@ -24,7 +26,9 @@ struct AppSettings: Codable {
         overlayStyle: .default,
         subtitleMode: .balanced,
         subtitleDisplayMode: .both,
-        glossary: [:]
+        glossary: [:],
+        cloudTranslation: .disabled,
+        cloudASR: .disabled
     )
 
     // Custom decoder so existing settings files load cleanly as new fields are added.
@@ -51,6 +55,10 @@ struct AppSettings: Codable {
             ?? AppSettings.default.subtitleDisplayMode
         glossary = (try? c.decodeIfPresent([String: String].self, forKey: .glossary))
             ?? AppSettings.default.glossary
+        cloudTranslation = (try? c.decodeIfPresent(CloudTranslationSettings.self, forKey: .cloudTranslation))
+            ?? AppSettings.default.cloudTranslation
+        cloudASR = (try? c.decodeIfPresent(CloudASRSettings.self, forKey: .cloudASR))
+            ?? AppSettings.default.cloudASR
     }
 
     init(
@@ -64,7 +72,9 @@ struct AppSettings: Codable {
         overlayStyle: OverlayStyle,
         subtitleMode: SubtitleMode,
         subtitleDisplayMode: SubtitleDisplayMode,
-        glossary: [String: String]
+        glossary: [String: String],
+        cloudTranslation: CloudTranslationSettings = .disabled,
+        cloudASR: CloudASRSettings = .disabled
     ) {
         self.selectedSourceID = selectedSourceID
         self.selectedSourceIDs = selectedSourceIDs
@@ -77,5 +87,7 @@ struct AppSettings: Codable {
         self.subtitleMode     = subtitleMode
         self.subtitleDisplayMode = subtitleDisplayMode
         self.glossary         = glossary
+        self.cloudTranslation = cloudTranslation
+        self.cloudASR         = cloudASR
     }
 }
