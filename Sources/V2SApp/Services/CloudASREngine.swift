@@ -55,7 +55,7 @@ final class CloudASREngine: @unchecked Sendable {
     // Sliding-window parameters (seconds @ 16 kHz int16 mono)
     private let sampleRate = 16_000
     private let windowSeconds = 8
-    private let stepSeconds = 4
+    private let stepSeconds = 6  // 2026-08-22: 4s step = 7200 audio-s/h = Groq free-tier hourly cap exactly; 6s leaves headroom
     private let rmsGate: Float = 0.008  // ~ int16 RMS 260; below → skip upload
 
     private let queue = DispatchQueue(label: "v2s.cloudASR", qos: .userInitiated)
@@ -66,6 +66,10 @@ final class CloudASREngine: @unchecked Sendable {
     private var converterInputSignature: AudioFormatSignature?
     private var stopped = false
     private var consecutiveFailures = 0
+    /// Rate-limit backoff: while in the future, windows are dropped but the
+    /// session stays alive (transient quota, not a config error).
+    private var rateLimitedUntil = Date.distantPast
+    private static let rateLimitBackoffSeconds: TimeInterval = 30
     private var uploadInFlight = false
 
     private struct AudioFormatSignature: Equatable {
@@ -117,6 +121,7 @@ final class CloudASREngine: @unchecked Sendable {
             guard self.rms(self.pcm) >= self.rmsGate else { return }
             guard self.uploadInFlight == false else { return }
             self.uploadInFlight = true
+            guard Date() >= self.rateLimitedUntil else { return }  // backing off: drop window, keep session
             let window = self.pcm
             Task { [weak self] in
                 await self?.upload(window)
@@ -141,6 +146,14 @@ final class CloudASREngine: @unchecked Sendable {
         } catch {
             queue.async { [weak self] in
                 guard let self else { return }
+                // 429/5xx = server-side transient (quota window, overload):
+                // drop this window, back off, NEVER escalate to fatal —
+                // the session must survive quota windows and self-heal.
+                if case CloudASRError.httpError(let status, _) = error,
+                   status == 429 || (500...599).contains(status) {
+                    self.rateLimitedUntil = Date().addingTimeInterval(Self.rateLimitBackoffSeconds)
+                    return
+                }
                 self.consecutiveFailures += 1
                 if self.consecutiveFailures >= 5 {
                     let message = "Cloud ASR keeps failing (\(self.consecutiveFailures) attempts): "
