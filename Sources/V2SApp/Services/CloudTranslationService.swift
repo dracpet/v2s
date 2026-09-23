@@ -18,7 +18,7 @@ struct CloudTranslationSettings: Codable, Equatable, Sendable {
         enabled: false,
         baseURL: "https://api.deepseek.com",
         apiKey: "",
-        model: "deepseek-chat",
+        model: "deepseek-flash",
         domainContext: "",
         slideContextEnabled: false,
         visionModel: "deepseek-v4-flash-vision-exp"
@@ -150,9 +150,10 @@ final class CloudTranslationService: Sendable {
             "stream": false,
             "temperature": 0.2,
             "max_tokens": Self.maxOutputTokens,
-            // Live subtitles want speed over depth: cap the reasoning budget.
-            // Measured 2026-08-22: 3.0s→1.2s/line, reasoning_tokens 172→15,
-            // translation quality unchanged.
+            // V4.1 models think by default (effort=high) and burn the whole
+            // output budget on hidden reasoning, returning empty content.
+            // Explicitly disable thinking; live subtitles want speed.
+            "thinking": ["type": "disabled"],
             "reasoning_effort": "low",
         ]
 
@@ -194,6 +195,7 @@ final class CloudTranslationService: Sendable {
             let retryPayload: [String: Any] = [
                 "model": payload["model"]!, "messages": retryMessages, "stream": false,
                 "temperature": 0.2, "max_tokens": Self.maxOutputTokens,
+                "thinking": ["type": "disabled"],
                 "reasoning_effort": "low",
             ]
             var retryRequest = URLRequest(url: url)
@@ -225,6 +227,7 @@ final class CloudTranslationService: Sendable {
             let retryPayload: [String: Any] = [
                 "model": payload["model"]!, "messages": retryMessages, "stream": false,
                 "temperature": 0.2, "max_tokens": Self.maxOutputTokens,
+                "thinking": ["type": "disabled"],
                 "reasoning_effort": "low",
             ]
             var retryRequest = URLRequest(url: url)

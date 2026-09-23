@@ -239,6 +239,7 @@ final class SlideContextService: ObservableObject {
             "stream": false,
             "temperature": 0.0,
             "max_tokens": 250,
+            "thinking": ["type": "disabled"],
             "reasoning_effort": "low",
         ]
 
