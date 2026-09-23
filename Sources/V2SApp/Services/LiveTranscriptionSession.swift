@@ -238,6 +238,23 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         case vadOffset
     }
 
+
+    private static func startupLog(_ msg: String) {
+        let dirs = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
+        guard let dir = dirs.first else { return }
+        let url = dir.appendingPathComponent("v2s").appendingPathComponent("startup_log.txt")
+        let line = ISO8601DateFormatter().string(from: Date()) + " [Session] " + msg + "\n"
+        if FileManager.default.fileExists(atPath: url.path) {
+            if let fh = try? FileHandle(forWritingTo: url) {
+                defer { try? fh.close() }
+                _ = try? fh.seekToEnd()
+                try? fh.write(contentsOf: line.data(using: .utf8) ?? Data())
+            }
+        } else {
+            try? line.write(to: url, atomically: true, encoding: .utf8)
+        }
+    }
+
     func start(
         source: InputSource,
         localeIdentifier: String,
@@ -278,14 +295,22 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
                 self.cloudASREngine = engine
             }
             // Speech recognition permission/models not needed for cloud ASR.
+            Self.startupLog("requesting permissions (skipSpeech=true)")
             try await requestRequiredPermissions(for: source, skipSpeech: true)
+            Self.startupLog("permissions granted (skipSpeech)")
         } else {
+        Self.startupLog("requesting permissions (skipSpeech=false)")
         try await requestRequiredPermissions(for: source)
+        Self.startupLog("permissions granted")
         }
         if cloudASR.enabled == false {
+            Self.startupLog("configuring modern speech recognizer")
             if try await configureModernSpeechRecognizer(localeIdentifier: localeIdentifier) == false {
+                Self.startupLog("modern recognizer unavailable, falling back")
                 try await runOnCaptureQueue {
+                    Self.startupLog("configuring legacy recognizer")
                     try self.configureSpeechRecognizer(localeIdentifier: localeIdentifier)
+                    Self.startupLog("legacy recognizer configured")
                 }
             }
         }
@@ -293,14 +318,20 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         switch source.category {
         case .microphone:
             try await runOnCaptureQueue {
+                Self.startupLog("starting microphone capture")
                 try self.startMicrophoneCapture(deviceUniqueID: source.detail)
+                Self.startupLog("microphone capture started")
             }
         case .application:
             let captureDescriptor = try await MainActor.run {
-                try self.makeApplicationCaptureDescriptor(for: source)
+                Self.startupLog("building app capture descriptor")
+                return try self.makeApplicationCaptureDescriptor(for: source)
             }
+            Self.startupLog("capture descriptor built")
             try await runOnCaptureQueue {
+                Self.startupLog("starting app audio capture")
                 try self.startApplicationAudioCapture(descriptor: captureDescriptor)
+                Self.startupLog("app audio capture started")
             }
         }
     }

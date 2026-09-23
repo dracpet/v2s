@@ -600,7 +600,25 @@ final class AppModel: ObservableObject {
         }
     }
 
+
+    private static func startupLog(_ msg: String) {
+        let dirs = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
+        guard let dir = dirs.first else { return }
+        let url = dir.appendingPathComponent("v2s").appendingPathComponent("startup_log.txt")
+        let line = ISO8601DateFormatter().string(from: Date()) + " [AppModel] " + msg + "\n"
+        if FileManager.default.fileExists(atPath: url.path) {
+            if let fh = try? FileHandle(forWritingTo: url) {
+                defer { try? fh.close() }
+                _ = try? fh.seekToEnd()
+                try? fh.write(contentsOf: line.data(using: .utf8) ?? Data())
+            }
+        } else {
+            try? line.write(to: url, atomically: true, encoding: .utf8)
+        }
+    }
+
     func startSession() async {
+        Self.startupLog("startSession entered")
         // Finish releasing any earlier capture resources before opening replacements.
         await stopLiveTranscriptionSessionsAndWait()
         refreshSources()
@@ -615,7 +633,9 @@ final class AppModel: ObservableObject {
 
         resetLiveTextPipeline()
         setStatus(.checkingLanguageResources)
+        Self.startupLog("awaiting language resource prep")
         await awaitSelectedLanguageResourcePreparationIfNeeded()
+        Self.startupLog("language resource prep done; blocking=\(self.hasBlockingLanguageResourceStatuses)")
         guard hasBlockingLanguageResourceStatuses == false else {
             setStatus(.downloadLanguageResourcesInSystemSettings)
             return
@@ -638,6 +658,7 @@ final class AppModel: ObservableObject {
         )
         overlayHistoryScrollOffset = 0
         setStatus(.preparing(sourceName: selectedSourceName))
+        Self.startupLog("entering per-source start loop for \(selectedSources.map(\.id))")
 
         let config = ModeConfig.config(for: subtitleMode)
         let recognitionHints = recognitionContextualStrings()
@@ -658,6 +679,7 @@ final class AppModel: ObservableObject {
             let sessionID = ObjectIdentifier(session)
 
             do {
+                Self.startupLog("starting source \(source.id)")
                 try await session.start(
                     source: source,
                     localeIdentifier: speechLocaleIdentifier(for: sourceLanguageID),
@@ -682,6 +704,7 @@ final class AppModel: ObservableObject {
                         )
                     },
                     errorHandler: { [weak self] message in
+                        Self.startupLog("errorHandler fired: \(message)")
                         self?.sessionState = .error
                         self?.setStatus(.custom(message))
                         self?.overlayState = OverlayPreviewState(
@@ -704,6 +727,7 @@ final class AppModel: ObservableObject {
                         fatalSessionErrors.append((message, sessionID, source.name))
                     }
                 )
+                Self.startupLog("session.start returned for \(source.id)")
 
                 startedSessions.append(session)
                 startedSources.append(source)
@@ -746,6 +770,7 @@ final class AppModel: ObservableObject {
 
         isStartingSession = false
 
+        Self.startupLog("start loop done; started=\(startedSessions.count) failures=\(startupFailures.count)")
         if startedSessions.isEmpty == false {
             liveTranscriptionSessions = startedSessions
             liveTranscriptionSession = startedSessions.first
@@ -761,6 +786,7 @@ final class AppModel: ObservableObject {
             )
 
             sessionState = .running
+            Self.startupLog("state -> running")
             let activeSourceName = activeSourceDisplayName
             setStatus(.running(sourceName: activeSourceName))
 
