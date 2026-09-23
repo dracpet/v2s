@@ -182,7 +182,35 @@ final class CloudTranslationService: Sendable {
             throw CloudTranslationError.malformedResponse
         }
 
-        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        var trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Empty-output guard: reasoning-style models (deepseek-v4-flash) can burn
+        // the whole token budget on hidden reasoning and return no content.
+        if trimmed.isEmpty {
+            var retryMessages = messages
+            retryMessages.append([
+                "role": "user",
+                "content": "Return the translation only. No reasoning, no preamble, just the translated text.",
+            ])
+            let retryPayload: [String: Any] = [
+                "model": payload["model"]!, "messages": retryMessages, "stream": false,
+                "temperature": 0.2, "max_tokens": Self.maxOutputTokens,
+                "reasoning_effort": "low",
+            ]
+            var retryRequest = URLRequest(url: url)
+            retryRequest.httpMethod = "POST"
+            retryRequest.timeoutInterval = 60
+            retryRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            retryRequest.setValue("Bearer \(settings.apiKey)", forHTTPHeaderField: "Authorization")
+            retryRequest.httpBody = try JSONSerialization.data(withJSONObject: retryPayload)
+            let (retryData, retryResponse) = try await session.data(for: retryRequest)
+            if let http = retryResponse as? HTTPURLResponse, http.statusCode == 200,
+               let obj = try JSONSerialization.jsonObject(with: retryData) as? [String: Any],
+               let ch = obj["choices"] as? [[String: Any]],
+               let msg = ch.first?["message"] as? [String: Any],
+               let retryContent = msg["content"] as? String {
+                trimmed = retryContent.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
         // Source-echo guard: with low reasoning effort the model sometimes
         // echoes Chinese back when the target is English. Detect CJK-heavy
         // output and retry once with a firmer instruction.
