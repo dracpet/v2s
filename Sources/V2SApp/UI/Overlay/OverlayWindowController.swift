@@ -626,7 +626,9 @@ final class OverlayWindowController {
                             min(style.maxWidth, visibleFrame.width))
             let height = resolvedPanelHeight(in: visibleFrame)
 
-            let originX = sourceFrame.minX
+            // Center the panel over the source window's capped width so a
+            // narrowed panel sits mid-video instead of hugging the left edge.
+            let originX = sourceFrame.minX + max(0, (cappedSourceWidth - width) / 2)
             let originY: Double
 
             if let topLeft = userDefinedTopLeft {
@@ -845,7 +847,8 @@ final class OverlayWindowController {
             let sourceWidth = sourceAppWindowFrame()?.width ?? visibleFrame.width
             let cappedSourceWidth = min(sourceWidth, style.maxWidth)
             let maximumWidth = min(cappedSourceWidth, visibleFrame.width)
-            let newWidth = min(max(resizeDragStartWidth - translation.width, style.minWidth), maximumWidth)
+            // Right edge anchored: dragging right widens, dragging left narrows.
+            let newWidth = min(max(resizeDragStartWidth + translation.width, style.minWidth), maximumWidth)
             let newWidthRatio = cappedSourceWidth > 0 ? newWidth / cappedSourceWidth : style.widthRatio
             liveResizeWidth = newWidth
             model.updateOverlayStyle { style in
