@@ -1113,13 +1113,23 @@ final class OverlayWindowController {
             return nil
         }
 
-        // Find the running application matching the source
-        let runningApp = NSWorkspace.shared.runningApplications.first { app in
-            app.bundleIdentifier == source.detail
+        // Find the running application(s) matching the source. Mini-program
+        // processes (e.g. WeChat's com.tencent.flue.WeChatAppEx) own the audio
+        // but their video window is hosted by the main app process, so include
+        // the family's main bundle when known.
+        let candidateBundleIDs: [String]
+        if source.detail == "com.tencent.flue.WeChatAppEx" {
+            candidateBundleIDs = [source.detail, "com.tencent.xinWeChat"]
+        } else {
+            candidateBundleIDs = [source.detail]
         }
-        guard let pid = runningApp?.processIdentifier else { return nil }
+        let runningApps = NSWorkspace.shared.runningApplications.filter { app in
+            candidateBundleIDs.contains(app.bundleIdentifier ?? "")
+        }
+        let ownerPIDs = Set(runningApps.map(\.processIdentifier))
+        guard ownerPIDs.isEmpty == false else { return nil }
 
-        // Query the window list for windows belonging to this PID
+        // Query the window list for windows belonging to these PIDs
         guard let windowInfoList = CGWindowListCopyWindowInfo(
             [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
         ) as? [[String: Any]] else {
@@ -1133,7 +1143,7 @@ final class OverlayWindowController {
 
         for info in windowInfoList {
             guard let ownerPID = info[kCGWindowOwnerPID as String] as? pid_t,
-                  ownerPID == pid,
+                  ownerPIDs.contains(ownerPID),
                   let boundsDict = info[kCGWindowBounds as String] as? [String: CGFloat],
                   let layer = info[kCGWindowLayer as String] as? Int,
                   layer == 0 else {

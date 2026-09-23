@@ -2782,6 +2782,17 @@ private struct ApplicationProcessAssociation {
                     "/Firefox.app/",
                     "plugin-container"
                 ])
+            case "com.tencent.xinWeChat":
+                // WeChat mini-programs (com.tencent.flue.WeChatAppEx) run in a
+                // sibling process that owns their audio; include it so a
+                // main-WeChat session still captures mini-program playback.
+                helperBundlePrefixes.append(contentsOf: [
+                    "com.tencent.flue.",
+                    "com.tencent.xinWeChat"
+                ])
+                helperPathFragments.append(contentsOf: [
+                    "/WeChat.app/"
+                ])
             default:
                 break
             }
