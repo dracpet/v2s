@@ -131,6 +131,12 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     private var speechRecognizer: SFSpeechRecognizer?
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
+    /// Consecutive recognition-task failures, reset on any successful result.
+    /// Drives exponential backoff + honest error surfacing (quota storms must
+    /// not spin at hundreds of failing requests per minute).
+    /// Cloud ASR engine (Groq-compatible chunked upload). When non-nil, audio
+    /// routes here instead of Apple's speech recognizers.
+    private var cloudASREngine: CloudASREngine?
     /// Incremented on every restart. Handlers capture their generation at creation time
     /// and discard callbacks that arrive after a newer generation has started.
     private var recognitionGeneration: Int = 0
@@ -238,6 +244,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         interfaceLanguageID: String,
         modeConfig: ModeConfig = .balanced,
         contextualStrings: [String] = [],
+        cloudASR: CloudASRSettings = .disabled,
         transcriptHandler: @escaping @MainActor (RecognizedSentence) -> Void,
         partialHandler: @escaping @MainActor (DraftSegment?) -> Void,
         errorHandler: @escaping @MainActor (String) -> Void,
@@ -255,10 +262,31 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             recentCommittedSentenceHistory.removeAll()
         }
 
-        try await requestRequiredPermissions(for: source)
-        if try await configureModernSpeechRecognizer(localeIdentifier: localeIdentifier) == false {
+        if cloudASR.enabled {
+            let engine = CloudASREngine(
+                settings: cloudASR,
+                localeIdentifier: localeIdentifier,
+                contextualHints: contextualStrings,
+                emitSentence: { [weak self] text in
+                    self?.transcriptHandler?(RecognizedSentence(text: text))
+                },
+                reportFatal: { [weak self] message in
+                    self?.errorHandler?(message)
+                }
+            )
             try await runOnCaptureQueue {
-                try self.configureSpeechRecognizer(localeIdentifier: localeIdentifier)
+                self.cloudASREngine = engine
+            }
+            // Speech recognition permission/models not needed for cloud ASR.
+            try await requestRequiredPermissions(for: source, skipSpeech: true)
+        } else {
+        try await requestRequiredPermissions(for: source)
+        }
+        if cloudASR.enabled == false {
+            if try await configureModernSpeechRecognizer(localeIdentifier: localeIdentifier) == false {
+                try await runOnCaptureQueue {
+                    try self.configureSpeechRecognizer(localeIdentifier: localeIdentifier)
+                }
             }
         }
 
@@ -297,6 +325,8 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     }
 
     private func stopOnCaptureQueue() {
+        cloudASREngine?.stop()
+        cloudASREngine = nil
         cancelSilenceTimer()
         cancelVADSilenceTimer()
 
@@ -329,8 +359,8 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         }
     }
 
-    private func requestRequiredPermissions(for source: InputSource) async throws {
-        let speechStatus = SFSpeechRecognizer.authorizationStatus()
+    private func requestRequiredPermissions(for source: InputSource, skipSpeech: Bool = false) async throws {
+        let speechStatus = skipSpeech ? .authorized : SFSpeechRecognizer.authorizationStatus()
 
         switch speechStatus {
         case .authorized:
@@ -598,6 +628,11 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         requiresOnDeviceRecognition: Bool
     ) -> SFSpeechAudioBufferRecognitionRequest {
         let request = SFSpeechAudioBufferRecognitionRequest()
+        // On-device where the locale supports it: avoids server quota entirely.
+        // (zh-Hans has no on-device model on Intel Macs → stays server-based.)
+        if speechRecognizer?.supportsOnDeviceRecognition == true {
+            request.requiresOnDeviceRecognition = true
+        }
         request.shouldReportPartialResults = true
         request.taskHint = .dictation
         request.addsPunctuation = true
@@ -849,6 +884,11 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             if vadResult.containsSpeechOnset {
                 cancelVADSilenceTimer()
             }
+        }
+
+        if let cloudASREngine {
+            cloudASREngine.ingest(processingBuffer)
+            return
         }
 
         if recognitionBackend == .speechAnalyzer {
@@ -1552,6 +1592,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     }
 
     private func processRecognitionResult(_ result: SFSpeechRecognitionResult) {
+        consecutiveRecognitionFailures = 0
         lastRecognitionResultTime = Date()
         // The recognizer is delivering again — forget any earlier failures.
         consecutiveRecognitionFailures = 0

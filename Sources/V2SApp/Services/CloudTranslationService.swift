@@ -163,7 +163,12 @@ final class CloudTranslationService: Sendable {
         request.setValue("Bearer \(settings.apiKey)", forHTTPHeaderField: "Authorization")
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
 
-        let (data, response) = try await session.data(for: request)
+        var (data, response) = try await session.data(for: request)
+        if let http = response as? HTTPURLResponse, http.statusCode == 429 {
+            // Rate-limit transient: one short retry beats a leaked CN row.
+            try await Task.sleep(nanoseconds: 2_000_000_000)
+            (data, response) = try await session.data(for: request)
+        }
         if let http = response as? HTTPURLResponse, http.statusCode != 200 {
             let detail = String(data: data.prefix(300), encoding: .utf8) ?? ""
             throw CloudTranslationError.httpError(http.statusCode, detail)
