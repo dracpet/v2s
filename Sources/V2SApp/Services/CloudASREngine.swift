@@ -62,6 +62,9 @@ final class CloudASREngine: @unchecked Sendable {
     private var pcm = Data()          // int16 LE mono @16k
     private var bytesSinceUpload = 0
     private var printed = ""          // last emitted transcript text
+    /// Aggregates window results until a sentence terminator so the translator
+    /// receives whole sentences instead of 6-second audio slices.
+    private var pendingFragment = ""
     private var converter: AVAudioConverter?
     private var converterInputSignature: AudioFormatSignature?
     private var stopped = false
@@ -118,7 +121,10 @@ final class CloudASREngine: @unchecked Sendable {
             guard self.bytesSinceUpload >= stepBytes else { return }
             self.bytesSinceUpload = 0
 
-            guard self.rms(self.pcm) >= self.rmsGate else { return }
+            guard self.rms(self.pcm) >= self.rmsGate else {
+                self.flushPending()  // speaker paused mid-fragment: release it
+                return
+            }
             guard self.uploadInFlight == false else { return }
             self.uploadInFlight = true
             guard Date() >= self.rateLimitedUntil else { return }  // backing off: drop window, keep session
@@ -140,8 +146,12 @@ final class CloudASREngine: @unchecked Sendable {
                 self.consecutiveFailures = 0
                 let merged = self.overlapMergedNew(text)
                 guard merged.isEmpty == false else { return }
-                let sentence = merged
-                Task { @MainActor in self.emitSentence(sentence) }
+                // Hold back until a sentence terminator; emit whole sentences.
+                self.pendingFragment += merged
+                let hasTerminator = self.pendingFragment.contains { "。！？!?.;；".contains($0) }
+                if hasTerminator || self.pendingFragment.count > 100 {
+                    self.flushPending()
+                }
             }
         } catch {
             queue.async { [weak self] in
@@ -166,6 +176,14 @@ final class CloudASREngine: @unchecked Sendable {
 
     /// Drop the prefix that repeats the tail of what we already emitted
     /// (the sliding window re-hears the last few seconds).
+    private func flushPending() {
+        guard pendingFragment.isEmpty == false else { return }
+        let sentence = pendingFragment.trimmingCharacters(in: .whitespacesAndNewlines)
+        pendingFragment = ""
+        guard sentence.isEmpty == false else { return }
+        Task { @MainActor in self.emitSentence(sentence) }
+    }
+
     private func overlapMergedNew(_ text: String) -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.isEmpty == false else { return "" }

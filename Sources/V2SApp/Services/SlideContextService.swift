@@ -212,17 +212,19 @@ final class SlideContextService: ObservableObject {
               settings.apiKey.isEmpty == false
         else { return "" }
 
-        // Slides are usually in Chinese: extract bilingual pairs so the
-        // injected context pushes the translator toward English output
-        // instead of biasing it toward echoing Chinese source text.
-        let prompt = "This is a screenshot of the presentation slide the speaker is "
-            + "currently showing during a tech talk. List the slide's technical terms, "
-            + "product names and proper nouns with their EXACT spelling as bilingual "
-            + "pairs: 中文术语 = English term. IMPORTANT: ignore any subtitles/captions "
-            + "overlaid on the video (scrolling text at the frame edge) — extract only "
-            + "the slide content itself. The slide spelling is ground "
-            + "truth for a speech-recognition pipeline that keeps misspelling them). "
-            + "Comma-separated pairs only, no commentary, at most 20 pairs."
+        // Bilingual pairs from the frame push the translator toward English
+        // output and anchor the correct spelling of domain terms.
+        let prompt = "This is a screenshot of a video frame from a tech talk. "
+            + "Extract technical terms, product names and proper nouns from the "
+            + "ON-SCREEN CONTENT ONLY — presentation slides, charts, diagrams, "
+            + "titles, UI text. List them with their EXACT spelling as bilingual "
+            + "pairs: 中文术语 = English term. CRITICAL: EXCLUDE the video's "
+            + "subtitles/captions entirely — any caption text (scrolling or static, "
+            + "usually at the bottom of the frame) is the subtitle track and must "
+            + "NOT be used as source material. The on-screen content spelling is "
+            + "ground truth for a speech-recognition pipeline that keeps "
+            + "misspelling these terms. Comma-separated pairs only, no commentary, "
+            + "at most 20 pairs."
         let payload: [String: Any] = [
             "model": settings.visionModel.isEmpty ? "deepseek-v4-flash-vision-exp" : settings.visionModel,
             "messages": [[
@@ -249,6 +251,8 @@ final class SlideContextService: ObservableObject {
 
         let (data, response) = try await URLSession.shared.data(for: request)
         if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+            Self.log("vision HTTP \(http.statusCode): " + (String(data: data.prefix(300), encoding: .utf8) ?? ""))
+            Self.logAvailableModels(settings: settings)
             return ""
         }
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -257,5 +261,40 @@ final class SlideContextService: ObservableObject {
               let content = message["content"] as? String
         else { return "" }
         return content.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Queries GET /models once on vision failure so the real model IDs
+    /// available to the configured API key land in slide_log.txt.
+    private static func logAvailableModels(settings: CloudTranslationSettings) {
+        let base = settings.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard let url = URL(string: base + "/models") else { return }
+        var req = URLRequest(url: url)
+        req.setValue("Bearer \(settings.apiKey)", forHTTPHeaderField: "Authorization")
+        req.timeoutInterval = 15
+        Task {
+            guard let (data, resp) = try? await URLSession.shared.data(for: req),
+                  (resp as? HTTPURLResponse)?.statusCode == 200,
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let models = obj["data"] as? [[String: Any]] else { return }
+            let ids = models.compactMap { $0["id"] as? String }.sorted()
+            log("available models: \(ids.joined(separator: ", "))")
+        }
+    }
+
+    private static func log(_ msg: String) {
+        let dirs = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
+        guard let dir = dirs.first else { return }
+        let url = dir.appendingPathComponent("v2s").appendingPathComponent("slide_log.txt")
+        let line = ISO8601DateFormatter().string(from: Date()) + " " + msg + "\n"
+        if FileManager.default.fileExists(atPath: url.path) {
+            if let fh = try? FileHandle(forWritingTo: url) {
+                defer { try? fh.close() }
+                _ = try? fh.seekToEnd()
+                try? fh.write(contentsOf: line.data(using: .utf8) ?? Data())
+            }
+        } else {
+            try? line.write(to: url, atomically: true, encoding: .utf8)
+        }
     }
 }

@@ -124,8 +124,8 @@ final class CloudTranslationService: Sendable {
         let slide = slideContext.trimmingCharacters(in: .whitespacesAndNewlines)
         if slide.isEmpty == false {
             system += " The speaker's current slide contains these terms — they hold "
-                + "the CORRECT spelling of what is being discussed; use them to fix "
-                + "misrecognized terms in the transcript: \(slide)."
+                + "the CORRECT spelling of what is being discussed. Lock these exact "
+                + "spellings in your output (never re-transliterate or vary them): \(slide)."
         }
         if glossary.isEmpty == false {
             let mappings = glossary
