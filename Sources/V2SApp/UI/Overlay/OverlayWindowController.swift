@@ -616,9 +616,14 @@ final class OverlayWindowController {
         let persistsUserDefinedPosition = userDefinedTopLeft != nil
         var overlayFrame: NSRect
 
-        // When attached to a source app, lock width & horizontal position to the source window
+        // When attached to a source app, follow the source window's horizontal
+        // position but size the panel by widthRatio (user-adjustable slider +
+        // edge drag), capped by maxWidth — fullscreen source windows would
+        // otherwise stretch the subtitle panel edge-to-edge.
         if style.attachToSource, let sourceFrame = sourceAppWindowFrame() {
-            let width = sourceFrame.width
+            let cappedSourceWidth = min(sourceFrame.width, style.maxWidth)
+            let width = min(max(cappedSourceWidth * style.widthRatio, style.minWidth),
+                            min(style.maxWidth, visibleFrame.width))
             let height = resolvedPanelHeight(in: visibleFrame)
 
             let originX = sourceFrame.minX
@@ -834,7 +839,18 @@ final class OverlayWindowController {
         let newHeight = min(max(resizeDragStartHeight - translation.height, minimumHeight), maximumHeight)
 
         if style.attachToSource {
-            // Height-only resize when attached to source; width is locked to source window
+            // Attached: height resize as before, and width resize now adjusts
+            // widthRatio (applied against the source window width) so the user
+            // can narrow a fullscreen-stretched panel by dragging its edge.
+            let sourceWidth = sourceAppWindowFrame()?.width ?? visibleFrame.width
+            let cappedSourceWidth = min(sourceWidth, style.maxWidth)
+            let maximumWidth = min(cappedSourceWidth, visibleFrame.width)
+            let newWidth = min(max(resizeDragStartWidth - translation.width, style.minWidth), maximumWidth)
+            let newWidthRatio = cappedSourceWidth > 0 ? newWidth / cappedSourceWidth : style.widthRatio
+            liveResizeWidth = newWidth
+            model.updateOverlayStyle { style in
+                style.widthRatio = newWidthRatio
+            }
             userDefinedTopLeft = NSPoint(x: resizeDragStartTopLeft.x, y: resizeDragStartTopLeft.y)
             userDefinedHeight = newHeight
         } else {
