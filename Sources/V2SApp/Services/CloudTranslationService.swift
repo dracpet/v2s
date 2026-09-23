@@ -213,12 +213,47 @@ final class CloudTranslationService: Sendable {
                let retryContent = msg["content"] as? String {
                 let retryTrimmed = retryContent.trimmingCharacters(in: .whitespacesAndNewlines)
                 if retryTrimmed.isEmpty == false {
+                    Self.logEntry(text: text, translated: retryTrimmed, sourceLanguageID: sourceLanguageID,
+                                  targetLanguageID: targetLanguageID, model: settings.model,
+                                  slideContext: slideContext, domainContext: settings.domainContext)
                     return retryTrimmed
                 }
             }
         }
 
+        Self.logEntry(text: text, translated: trimmed, sourceLanguageID: sourceLanguageID,
+                      targetLanguageID: targetLanguageID, model: settings.model,
+                      slideContext: slideContext, domainContext: settings.domainContext)
         return trimmed
+    }
+
+    /// Appends one src→tgt pair to translation_log.jsonl in Application
+    /// Support/v2s — the ground-truth sample stream for quality analysis.
+    private static func logEntry(
+        text: String, translated: String,
+        sourceLanguageID: String, targetLanguageID: String,
+        model: String, slideContext: String, domainContext: String
+    ) {
+        let ts = ISO8601DateFormatter().string(from: Date())
+        let obj: [String: Any] = [
+            "ts": ts, "src": text, "tgt": translated,
+            "lang": "\(sourceLanguageID)->\(targetLanguageID)",
+            "model": model, "ctxLen": slideContext.count, "domainLen": domainContext.count
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: obj),
+              let line = String(data: data, encoding: .utf8) else { return }
+        guard let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return }
+        let url = dir.appendingPathComponent("v2s").appendingPathComponent("translation_log.jsonl")
+        let lineWithNewline = line + "\n"
+        if FileManager.default.fileExists(atPath: url.path) {
+            if let fh = try? FileHandle(forWritingTo: url) {
+                defer { try? fh.close() }
+                _ = try? fh.seekToEnd()
+                try? fh.write(contentsOf: lineWithNewline.data(using: .utf8) ?? Data())
+            }
+        } else {
+            try? lineWithNewline.write(to: url, atomically: true, encoding: .utf8)
+        }
     }
 
     private static func isCJKHeavy(_ text: String) -> Bool {
