@@ -626,9 +626,14 @@ final class OverlayWindowController {
                             min(style.maxWidth, visibleFrame.width))
             let height = resolvedPanelHeight(in: visibleFrame)
 
-            // Center the panel over the source window's capped width so a
-            // narrowed panel sits mid-video instead of hugging the left edge.
-            let originX = sourceFrame.minX + max(0, (cappedSourceWidth - width) / 2)
+            // User-dragged X wins; default = centered over the source window's
+            // capped width so a narrowed panel sits mid-video.
+            let originX: Double
+            if let topLeft = userDefinedTopLeft {
+                originX = topLeft.x
+            } else {
+                originX = sourceFrame.minX + max(0, (cappedSourceWidth - width) / 2)
+            }
             let originY: Double
 
             if let topLeft = userDefinedTopLeft {
@@ -797,9 +802,10 @@ final class OverlayWindowController {
         guard let dragStartTopLeft else { return }
 
         if model.overlayStyle.attachToSource {
-            // Vertical movement only when attached to source
+            // Attached: user can drag anywhere (vertical + horizontal); the
+            // source-window X only applies until the user takes over.
             userDefinedTopLeft = NSPoint(
-                x: dragStartTopLeft.x,
+                x: dragStartTopLeft.x + translation.width,
                 y: dragStartTopLeft.y + translation.height
             )
         } else {
