@@ -1113,23 +1113,17 @@ final class OverlayWindowController {
             return nil
         }
 
-        // Find the running application(s) matching the source. Mini-program
-        // processes (e.g. WeChat's com.tencent.flue.WeChatAppEx) own the audio
-        // but their video window is hosted by the main app process, so include
-        // the family's main bundle when known.
-        let candidateBundleIDs: [String]
-        if source.detail == "com.tencent.flue.WeChatAppEx" {
-            candidateBundleIDs = [source.detail, "com.tencent.xinWeChat"]
-        } else {
-            candidateBundleIDs = [source.detail]
+        // Match windows by owner NAME, not bundleIdentifier: the latter is a
+        // synchronous LaunchServices IPC that can wedge on the main thread
+        // against a busy launchservicesd and freeze the whole UI. WeChat
+        // mini-program windows are hosted by the main WeChat process, so a
+        // WeChatAppEx source must match the main app's window owner too.
+        var candidateOwnerNames: Set<String> = [source.name]
+        if source.detail == "com.tencent.flue.WeChatAppEx"
+            || source.detail == "com.tencent.xinWeChat" {
+            candidateOwnerNames.formUnion(["WeChat", "微信"])
         }
-        let runningApps = NSWorkspace.shared.runningApplications.filter { app in
-            candidateBundleIDs.contains(app.bundleIdentifier ?? "")
-        }
-        let ownerPIDs = Set(runningApps.map(\.processIdentifier))
-        guard ownerPIDs.isEmpty == false else { return nil }
 
-        // Query the window list for windows belonging to these PIDs
         guard let windowInfoList = CGWindowListCopyWindowInfo(
             [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
         ) as? [[String: Any]] else {
@@ -1142,8 +1136,8 @@ final class OverlayWindowController {
         var bestArea: CGFloat = 0
 
         for info in windowInfoList {
-            guard let ownerPID = info[kCGWindowOwnerPID as String] as? pid_t,
-                  ownerPIDs.contains(ownerPID),
+            guard let ownerName = info[kCGWindowOwnerName as String] as? String,
+                  candidateOwnerNames.contains(ownerName),
                   let boundsDict = info[kCGWindowBounds as String] as? [String: CGFloat],
                   let layer = info[kCGWindowLayer as String] as? Int,
                   layer == 0 else {
