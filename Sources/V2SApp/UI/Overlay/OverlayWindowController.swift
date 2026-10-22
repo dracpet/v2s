@@ -616,12 +616,24 @@ final class OverlayWindowController {
         let persistsUserDefinedPosition = userDefinedTopLeft != nil
         var overlayFrame: NSRect
 
-        // When attached to a source app, lock width & horizontal position to the source window
+        // When attached to a source app, follow the source window's horizontal
+        // position but size the panel by widthRatio (user-adjustable slider +
+        // edge drag), capped by maxWidth — fullscreen source windows would
+        // otherwise stretch the subtitle panel edge-to-edge.
         if style.attachToSource, let sourceFrame = sourceAppWindowFrame() {
-            let width = sourceFrame.width
+            let cappedSourceWidth = min(sourceFrame.width, style.maxWidth)
+            let width = min(max(cappedSourceWidth * style.widthRatio, style.minWidth),
+                            min(style.maxWidth, visibleFrame.width))
             let height = resolvedPanelHeight(in: visibleFrame)
 
-            let originX = sourceFrame.minX
+            // User-dragged X wins; default = centered over the source window's
+            // capped width so a narrowed panel sits mid-video.
+            let originX: Double
+            if let topLeft = userDefinedTopLeft {
+                originX = topLeft.x
+            } else {
+                originX = sourceFrame.minX + max(0, (cappedSourceWidth - width) / 2)
+            }
             let originY: Double
 
             if let topLeft = userDefinedTopLeft {
@@ -790,9 +802,10 @@ final class OverlayWindowController {
         guard let dragStartTopLeft else { return }
 
         if model.overlayStyle.attachToSource {
-            // Vertical movement only when attached to source
+            // Attached: user can drag anywhere (vertical + horizontal); the
+            // source-window X only applies until the user takes over.
             userDefinedTopLeft = NSPoint(
-                x: dragStartTopLeft.x,
+                x: dragStartTopLeft.x + translation.width,
                 y: dragStartTopLeft.y + translation.height
             )
         } else {
@@ -834,7 +847,19 @@ final class OverlayWindowController {
         let newHeight = min(max(resizeDragStartHeight - translation.height, minimumHeight), maximumHeight)
 
         if style.attachToSource {
-            // Height-only resize when attached to source; width is locked to source window
+            // Attached: height resize as before, and width resize now adjusts
+            // widthRatio (applied against the source window width) so the user
+            // can narrow a fullscreen-stretched panel by dragging its edge.
+            let sourceWidth = sourceAppWindowFrame()?.width ?? visibleFrame.width
+            let cappedSourceWidth = min(sourceWidth, style.maxWidth)
+            let maximumWidth = min(cappedSourceWidth, visibleFrame.width)
+            // Right edge anchored: dragging right widens, dragging left narrows.
+            let newWidth = min(max(resizeDragStartWidth + translation.width, style.minWidth), maximumWidth)
+            let newWidthRatio = cappedSourceWidth > 0 ? newWidth / cappedSourceWidth : style.widthRatio
+            liveResizeWidth = newWidth
+            model.updateOverlayStyle { style in
+                style.widthRatio = newWidthRatio
+            }
             userDefinedTopLeft = NSPoint(x: resizeDragStartTopLeft.x, y: resizeDragStartTopLeft.y)
             userDefinedHeight = newHeight
         } else {
@@ -1113,13 +1138,17 @@ final class OverlayWindowController {
             return nil
         }
 
-        // Find the running application matching the source
-        let runningApp = NSWorkspace.shared.runningApplications.first { app in
-            app.bundleIdentifier == source.detail
+        // Match windows by owner NAME, not bundleIdentifier: the latter is a
+        // synchronous LaunchServices IPC that can wedge on the main thread
+        // against a busy launchservicesd and freeze the whole UI. WeChat
+        // mini-program windows are hosted by the main WeChat process, so a
+        // WeChatAppEx source must match the main app's window owner too.
+        var candidateOwnerNames: Set<String> = [source.name]
+        if source.detail == "com.tencent.flue.WeChatAppEx"
+            || source.detail == "com.tencent.xinWeChat" {
+            candidateOwnerNames.formUnion(["WeChat", "微信"])
         }
-        guard let pid = runningApp?.processIdentifier else { return nil }
 
-        // Query the window list for windows belonging to this PID
         guard let windowInfoList = CGWindowListCopyWindowInfo(
             [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
         ) as? [[String: Any]] else {
@@ -1132,8 +1161,8 @@ final class OverlayWindowController {
         var bestArea: CGFloat = 0
 
         for info in windowInfoList {
-            guard let ownerPID = info[kCGWindowOwnerPID as String] as? pid_t,
-                  ownerPID == pid,
+            guard let ownerName = info[kCGWindowOwnerName as String] as? String,
+                  candidateOwnerNames.contains(ownerName),
                   let boundsDict = info[kCGWindowBounds as String] as? [String: CGFloat],
                   let layer = info[kCGWindowLayer as String] as? Int,
                   layer == 0 else {

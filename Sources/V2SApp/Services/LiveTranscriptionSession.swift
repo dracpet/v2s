@@ -135,6 +135,12 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     private var speechRecognizer: SFSpeechRecognizer?
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
+    /// Consecutive recognition-task failures, reset on any successful result.
+    /// Drives exponential backoff + honest error surfacing (quota storms must
+    /// not spin at hundreds of failing requests per minute).
+    /// Cloud ASR engine (Groq-compatible chunked upload). When non-nil, audio
+    /// routes here instead of Apple's speech recognizers.
+    private var cloudASREngine: CloudASREngine?
     /// Incremented on every restart. Handlers capture their generation at creation time
     /// and discard callbacks that arrive after a newer generation has started.
     private var recognitionGeneration: Int = 0
@@ -249,12 +255,30 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         case vadOffset
     }
 
+
+    private static func startupLog(_ msg: String) {
+        let dirs = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
+        guard let dir = dirs.first else { return }
+        let url = dir.appendingPathComponent("v2s").appendingPathComponent("startup_log.txt")
+        let line = ISO8601DateFormatter().string(from: Date()) + " [Session] " + msg + "\n"
+        if FileManager.default.fileExists(atPath: url.path) {
+            if let fh = try? FileHandle(forWritingTo: url) {
+                defer { try? fh.close() }
+                _ = try? fh.seekToEnd()
+                try? fh.write(contentsOf: line.data(using: .utf8) ?? Data())
+            }
+        } else {
+            try? line.write(to: url, atomically: true, encoding: .utf8)
+        }
+    }
+
     func start(
         source: InputSource,
         localeIdentifier: String,
         interfaceLanguageID: String,
         modeConfig: ModeConfig = .balanced,
         contextualStrings: [String] = [],
+        cloudASR: CloudASRSettings = .disabled,
         transcriptHandler: @escaping @MainActor (RecognizedSentence) -> Void,
         partialHandler: @escaping @MainActor (DraftSegment?) -> Void,
         errorHandler: @escaping @MainActor (String) -> Void,
@@ -272,24 +296,59 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             recentCommittedSentenceHistory.removeAll()
         }
 
-        try await requestRequiredPermissions(for: source)
-        if try await configureModernSpeechRecognizer(localeIdentifier: localeIdentifier) == false {
+        if cloudASR.enabled {
+            let engine = CloudASREngine(
+                settings: cloudASR,
+                localeIdentifier: localeIdentifier,
+                contextualHints: contextualStrings,
+                emitSentence: { [weak self] text in
+                    self?.transcriptHandler?(RecognizedSentence(text: text))
+                },
+                reportFatal: { [weak self] message in
+                    self?.errorHandler?(message)
+                }
+            )
             try await runOnCaptureQueue {
-                try self.configureSpeechRecognizer(localeIdentifier: localeIdentifier)
+                self.cloudASREngine = engine
+            }
+            // Speech recognition permission/models not needed for cloud ASR.
+            Self.startupLog("requesting permissions (skipSpeech=true)")
+            try await requestRequiredPermissions(for: source, skipSpeech: true)
+            Self.startupLog("permissions granted (skipSpeech)")
+        } else {
+        Self.startupLog("requesting permissions (skipSpeech=false)")
+        try await requestRequiredPermissions(for: source)
+        Self.startupLog("permissions granted")
+        }
+        if cloudASR.enabled == false {
+            Self.startupLog("configuring modern speech recognizer")
+            if try await configureModernSpeechRecognizer(localeIdentifier: localeIdentifier) == false {
+                Self.startupLog("modern recognizer unavailable, falling back")
+                try await runOnCaptureQueue {
+                    Self.startupLog("configuring legacy recognizer")
+                    try self.configureSpeechRecognizer(localeIdentifier: localeIdentifier)
+                    Self.startupLog("legacy recognizer configured")
+                }
             }
         }
 
         switch source.category {
         case .microphone:
             try await runOnCaptureQueue {
+                Self.startupLog("starting microphone capture")
                 try self.startMicrophoneCapture(deviceUniqueID: source.detail)
+                Self.startupLog("microphone capture started")
             }
         case .application:
             let captureDescriptor = try await MainActor.run {
-                try self.makeApplicationCaptureDescriptor(for: source)
+                Self.startupLog("building app capture descriptor")
+                return try self.makeApplicationCaptureDescriptor(for: source)
             }
+            Self.startupLog("capture descriptor built")
             try await runOnCaptureQueue {
+                Self.startupLog("starting app audio capture")
                 try self.startApplicationAudioCapture(descriptor: captureDescriptor)
+                Self.startupLog("app audio capture started")
             }
         }
     }
@@ -314,6 +373,8 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     }
 
     private func stopOnCaptureQueue() {
+        cloudASREngine?.stop()
+        cloudASREngine = nil
         cancelSilenceTimer()
         cancelVADSilenceTimer()
 
@@ -347,8 +408,8 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         }
     }
 
-    private func requestRequiredPermissions(for source: InputSource) async throws {
-        let speechStatus = SFSpeechRecognizer.authorizationStatus()
+    private func requestRequiredPermissions(for source: InputSource, skipSpeech: Bool = false) async throws {
+        let speechStatus = skipSpeech ? .authorized : SFSpeechRecognizer.authorizationStatus()
 
         switch speechStatus {
         case .authorized:
@@ -616,6 +677,11 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         requiresOnDeviceRecognition: Bool
     ) -> SFSpeechAudioBufferRecognitionRequest {
         let request = SFSpeechAudioBufferRecognitionRequest()
+        // On-device where the locale supports it: avoids server quota entirely.
+        // (zh-Hans has no on-device model on Intel Macs → stays server-based.)
+        if speechRecognizer?.supportsOnDeviceRecognition == true {
+            request.requiresOnDeviceRecognition = true
+        }
         request.shouldReportPartialResults = true
         request.taskHint = .dictation
         request.addsPunctuation = true
@@ -1074,6 +1140,11 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             if vadResult.containsSpeechOnset {
                 cancelVADSilenceTimer()
             }
+        }
+
+        if let cloudASREngine {
+            cloudASREngine.ingest(processingBuffer)
+            return
         }
 
         if recognitionBackend == .speechAnalyzer {
@@ -1756,6 +1827,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     }
 
     private func processRecognitionResult(_ result: SFSpeechRecognitionResult) {
+        consecutiveRecognitionFailures = 0
         lastRecognitionResultTime = Date()
         // The recognizer is delivering again — forget any earlier failures.
         consecutiveRecognitionFailures = 0
@@ -3500,6 +3572,17 @@ private struct ApplicationProcessAssociation {
                 helperPathFragments.append(contentsOf: [
                     "/Firefox.app/",
                     "plugin-container"
+                ])
+            case "com.tencent.xinWeChat":
+                // WeChat mini-programs (com.tencent.flue.WeChatAppEx) run in a
+                // sibling process that owns their audio; include it so a
+                // main-WeChat session still captures mini-program playback.
+                helperBundlePrefixes.append(contentsOf: [
+                    "com.tencent.flue.",
+                    "com.tencent.xinWeChat"
+                ])
+                helperPathFragments.append(contentsOf: [
+                    "/WeChat.app/"
                 ])
             default:
                 break

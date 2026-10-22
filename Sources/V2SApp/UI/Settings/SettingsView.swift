@@ -131,11 +131,117 @@ struct SettingsView: View {
                     )
                 }
                 settingsCard {
+                    sectionHeader("Cloud Translation", icon: "cloud")
+                    SettingsControlRow(label: "Use cloud backend (DeepSeek-compatible)") {
+                        Toggle("", isOn: Binding(
+                            get: { model.cloudTranslation.enabled },
+                            set: { model.cloudTranslation.enabled = $0 }
+                        ))
+                        .labelsHidden()
+                    }
+                    if model.cloudTranslation.enabled {
+                        Divider()
+                        SettingsControlRow(label: "Base URL") {
+                            TextField("https://api.deepseek.com", text: Binding(
+                                get: { model.cloudTranslation.baseURL },
+                                set: { model.cloudTranslation.baseURL = $0 }
+                            ))
+                            .textFieldStyle(.roundedBorder)
+                            .frame(minWidth: 220)
+                        }
+                        Divider()
+                        SettingsControlRow(label: "API key") {
+                            SecureField("sk-...", text: Binding(
+                                get: { model.cloudTranslation.apiKey },
+                                set: { model.cloudTranslation.apiKey = $0 }
+                            ))
+                            .textFieldStyle(.roundedBorder)
+                            .frame(minWidth: 220)
+                        }
+                        Divider()
+                        SettingsControlRow(label: "Model") {
+                            TextField("deepseek-chat", text: Binding(
+                                get: { model.cloudTranslation.model },
+                                set: { model.cloudTranslation.model = $0 }
+                            ))
+                            .textFieldStyle(.roundedBorder)
+                            .frame(minWidth: 220)
+                        }
+                        Divider()
+                        SettingsControlRow(label: "Domain context (optional)") {
+                            TextField("e.g. tech talk about databases", text: Binding(
+                                get: { model.cloudTranslation.domainContext },
+                                set: { model.cloudTranslation.domainContext = $0 }
+                            ))
+                            .textFieldStyle(.roundedBorder)
+                            .frame(minWidth: 220)
+                        }
+                        Divider()
+                        SettingsControlRow(label: "Slide context (vision reads slides)") {
+                            Toggle("", isOn: Binding(
+                                get: { model.cloudTranslation.slideContextEnabled },
+                                set: { model.cloudTranslation.slideContextEnabled = $0 }
+                            ))
+                            .labelsHidden()
+                        }
+                        if model.cloudTranslation.slideContextEnabled {
+                            Divider()
+                            SettingsControlRow(label: "Vision model") {
+                                TextField("deepseek-v4-flash-vision-exp", text: Binding(
+                                    get: { model.cloudTranslation.visionModel },
+                                    set: { model.cloudTranslation.visionModel = $0 }
+                                ))
+                                .textFieldStyle(.roundedBorder)
+                                .frame(minWidth: 220)
+                            }
+                        }
+                    }
+                }
+                settingsCard {
+                    sectionHeader("Cloud ASR (speech recognition)", icon: "waveform.badge.mic")
+                    SettingsControlRow(label: "Use cloud ASR (Groq-compatible)") {
+                        Toggle("", isOn: Binding(
+                            get: { model.cloudASR.enabled },
+                            set: { model.cloudASR.enabled = $0 }
+                        ))
+                        .labelsHidden()
+                    }
+                    if model.cloudASR.enabled {
+                        Divider()
+                        SettingsControlRow(label: "Base URL") {
+                            TextField("https://api.groq.com/openai/v1", text: Binding(
+                                get: { model.cloudASR.baseURL },
+                                set: { model.cloudASR.baseURL = $0 }
+                            ))
+                            .textFieldStyle(.roundedBorder)
+                            .frame(minWidth: 220)
+                        }
+                        Divider()
+                        SettingsControlRow(label: "API key") {
+                            SecureField("gsk_...", text: Binding(
+                                get: { model.cloudASR.apiKey },
+                                set: { model.cloudASR.apiKey = $0 }
+                            ))
+                            .textFieldStyle(.roundedBorder)
+                            .frame(minWidth: 220)
+                        }
+                        Divider()
+                        SettingsControlRow(label: "Model") {
+                            TextField("whisper-large-v3-turbo", text: Binding(
+                                get: { model.cloudASR.model },
+                                set: { model.cloudASR.model = $0 }
+                            ))
+                            .textFieldStyle(.roundedBorder)
+                            .frame(minWidth: 220)
+                        }
+                    }
+                }
+                settingsCard {
                     sectionHeader(model.localized(.languages), icon: "globe")
                     SettingsControlRow(label: model.localized(.defaultInputLanguage)) {
                         CommonLanguageMenuPicker(
                             interfaceLanguageID: model.resolvedInterfaceLanguageID,
-                            options: model.speechLanguageOptions,
+                            options: LanguageCatalog.sourceOptions(cloudASREnabled: model.cloudASR.enabled),
                             selection: model.inputLanguageSelectionBinding
                         )
                         .disabled(model.isLanguagePairLocked)
@@ -150,7 +256,7 @@ struct SettingsView: View {
                     SettingsControlRow(label: model.localized(.defaultSubtitleLanguage)) {
                         CommonLanguageMenuPicker(
                             interfaceLanguageID: model.resolvedInterfaceLanguageID,
-                            options: model.translationLanguageOptions,
+                            options: LanguageCatalog.targetOptions(cloudTranslationEnabled: model.cloudTranslation.enabled),
                             selection: model.outputLanguageSelectionBinding
                         )
                         .disabled(model.isLanguagePairLocked)
@@ -506,7 +612,7 @@ struct SettingsView: View {
                     SettingsControlRow(label: model.localized(.inputLanguage)) {
                         DefaultableLanguageMenuPicker(
                             interfaceLanguageID: model.resolvedInterfaceLanguageID,
-                            options: model.speechLanguageOptions,
+                            options: LanguageCatalog.sourceOptions(cloudASREnabled: model.cloudASR.enabled),
                             defaultTitle: model.localized(
                                 .useDefaultFormat,
                                 model.languageName(for: model.inputLanguageID)
@@ -518,7 +624,7 @@ struct SettingsView: View {
                     SettingsControlRow(label: model.localized(.subtitleLanguage)) {
                         DefaultableLanguageMenuPicker(
                             interfaceLanguageID: model.resolvedInterfaceLanguageID,
-                            options: model.translationLanguageOptions,
+                            options: LanguageCatalog.targetOptions(cloudTranslationEnabled: model.cloudTranslation.enabled),
                             defaultTitle: model.localized(
                                 .useDefaultFormat,
                                 model.languageName(for: model.outputLanguageID)

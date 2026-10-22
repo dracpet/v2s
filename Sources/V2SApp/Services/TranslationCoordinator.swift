@@ -122,11 +122,24 @@ final class TranslationCoordinator: ObservableObject {
     private var translationMemoOrder: [MemoKey] = []
     var consecutiveTimeouts: Int = 0
 
+    // Cloud translation backend (OpenAI-compatible, e.g. DeepSeek).
+    // When cloudSettings.enabled, translate()/prepareIfNeeded() bypass Apple's
+    // Translation framework entirely — no availability checks, no session runner.
+    var cloudSettings = CloudTranslationSettings.disabled
+    var cloudGlossary: [String: String] = [:]
+    /// Latest slide terms from SlideContextService (rolling multi-slide union).
+    var cloudSlideContext: String = ""
+    private let cloudService = CloudTranslationService()
+    private var cloudHistory: [(source: String, target: String)] = []
+
     func prepareIfNeeded(
         from sourceIdentifier: String,
         to targetIdentifier: String
     ) async throws {
         guard sourceIdentifier != targetIdentifier else {
+            return
+        }
+        guard cloudSettings.enabled == false else {
             return
         }
 
@@ -168,6 +181,23 @@ final class TranslationCoordinator: ObservableObject {
 
         guard sourceIdentifier != targetIdentifier else {
             return trimmedText
+        }
+
+        if cloudSettings.enabled {
+            let translated = try await cloudService.translate(
+                trimmedText,
+                from: sourceIdentifier,
+                to: targetIdentifier,
+                settings: cloudSettings,
+                glossary: cloudGlossary,
+                history: cloudHistory,
+                slideContext: cloudSlideContext
+            )
+            cloudHistory.append((source: trimmedText, target: translated))
+            if cloudHistory.count > 6 {
+                cloudHistory.removeFirst(cloudHistory.count - 6)
+            }
+            return translated
         }
 
         let pair = LanguagePair(source: sourceIdentifier, target: targetIdentifier)

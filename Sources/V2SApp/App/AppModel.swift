@@ -31,6 +31,9 @@ private enum AppBuildInfo {
 @MainActor
 final class AppModel: ObservableObject {
     private let settingsStore: SettingsStore
+    private var slideContextService: SlideContextService?
+    private var slideContextCancellable: AnyCancellable?
+    private var sessionStateCancellable: AnyCancellable?
     private let sourceCatalogService: SourceCatalogService
     private let translationCoordinator = TranslationCoordinator()
     private let glossaryService = GlossaryService()
@@ -94,6 +97,23 @@ final class AppModel: ObservableObject {
         didSet {
             persistSettings()
             syncOverlayPreviewIfNeeded()
+        }
+    }
+
+    /// Cloud translation backend settings (DeepSeek-compatible). didSet syncs
+    /// the coordinator immediately so a running session picks up changes.
+    @Published var cloudTranslation: CloudTranslationSettings = .disabled {
+        didSet {
+            syncCloudTranslationSettings()
+            persistSettings()
+        }
+    }
+
+    /// Cloud ASR backend settings (Groq-compatible). Read at session start;
+    /// toggling mid-session takes effect on the next session.
+    @Published var cloudASR: CloudASRSettings = .disabled {
+        didSet {
+            persistSettings()
         }
     }
 
@@ -201,9 +221,11 @@ final class AppModel: ObservableObject {
             initialSelectedSourceIDs = [selectedSourceID]
         }
         self.selectedSourceIDs = initialSelectedSourceIDs
-        self.sourceLanguageOverrides = settings.sourceLanguageOverrides
+        self.sourceLanguageOverrides = settings.sourceLanguageOverrides.mapValues {
+            LanguageCatalog.supportedSpeechInputLanguageID(for: $0, cloudASREnabled: settings.cloudASR.enabled)
+        }
         self.sourceOutputLanguageOverrides = settings.sourceOutputLanguageOverrides
-        self.inputLanguageID = settings.inputLanguageID
+        self.inputLanguageID = LanguageCatalog.supportedSpeechInputLanguageID(for: settings.inputLanguageID, cloudASREnabled: settings.cloudASR.enabled)
         self.outputLanguageID = settings.outputLanguageID
         self.usesSystemInterfaceLanguage = settings.interfaceLanguageID == nil
         self.interfaceLanguageID = LanguageCatalog.preferredInterfaceLanguageID(
@@ -214,6 +236,8 @@ final class AppModel: ObservableObject {
         self.subtitleMode = settings.subtitleMode
         self.subtitleDisplayMode = settings.subtitleDisplayMode
         self.glossary = settings.glossary
+        self.cloudTranslation = settings.cloudTranslation
+        self.cloudASR = settings.cloudASR
         self.translationHostConfiguration = nil
         AppLocalization.updateEmbeddedBundleLocalizationLanguageID(self.interfaceLanguageID)
 
@@ -224,6 +248,26 @@ final class AppModel: ObservableObject {
             self?.translationLocaleIdentifier(for: languageID)
                 ?? LanguageCatalog.translationLocaleIdentifier(for: languageID)
         }
+
+        syncCloudTranslationSettings()
+
+        let slideService = SlideContextService(
+            bundleIDProvider: { [weak self] in
+                guard let source = self?.selectedSource,
+                      source.category == .application else { return nil }
+                return source.detail
+            },
+            settingsProvider: { [weak self] in self?.cloudTranslation ?? .disabled }
+        )
+        self.slideContextService = slideService
+        slideContextCancellable = slideService.$currentTerms
+            .sink { [weak self] terms in
+                self?.translationCoordinator.cloudSlideContext = terms
+            }
+        sessionStateCancellable = $sessionState
+            .sink { [weak slideService] state in
+                if state == .running { slideService?.start() } else { slideService?.stop() }
+            }
 
         isBootstrapping = false
         applyStatusMessage()
@@ -296,7 +340,7 @@ final class AppModel: ObservableObject {
 
     func setLanguageID(_ languageID: String, for source: InputSource) {
         var overrides = sourceLanguageOverrides
-        let normalizedLanguageID = supportedSpeechInputLanguageID(languageID)
+        let normalizedLanguageID = LanguageCatalog.supportedSpeechInputLanguageID(for: languageID, cloudASREnabled: cloudASR.enabled)
         if normalizedLanguageID == inputLanguageID {
             overrides.removeValue(forKey: source.id)
         } else {
@@ -556,7 +600,25 @@ final class AppModel: ObservableObject {
         }
     }
 
+
+    private static func startupLog(_ msg: String) {
+        let dirs = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
+        guard let dir = dirs.first else { return }
+        let url = dir.appendingPathComponent("v2s").appendingPathComponent("startup_log.txt")
+        let line = ISO8601DateFormatter().string(from: Date()) + " [AppModel] " + msg + "\n"
+        if FileManager.default.fileExists(atPath: url.path) {
+            if let fh = try? FileHandle(forWritingTo: url) {
+                defer { try? fh.close() }
+                _ = try? fh.seekToEnd()
+                try? fh.write(contentsOf: line.data(using: .utf8) ?? Data())
+            }
+        } else {
+            try? line.write(to: url, atomically: true, encoding: .utf8)
+        }
+    }
+
     func startSession() async {
+        Self.startupLog("startSession entered")
         // Finish releasing any earlier capture resources before opening replacements.
         await stopLiveTranscriptionSessionsAndWait()
         refreshSources()
@@ -571,7 +633,9 @@ final class AppModel: ObservableObject {
 
         resetLiveTextPipeline()
         setStatus(.checkingLanguageResources)
+        Self.startupLog("awaiting language resource prep")
         await awaitSelectedLanguageResourcePreparationIfNeeded()
+        Self.startupLog("language resource prep done; blocking=\(self.hasBlockingLanguageResourceStatuses)")
         guard hasBlockingLanguageResourceStatuses == false else {
             setStatus(.downloadLanguageResourcesInSystemSettings)
             return
@@ -594,6 +658,7 @@ final class AppModel: ObservableObject {
         )
         overlayHistoryScrollOffset = 0
         setStatus(.preparing(sourceName: selectedSourceName))
+        Self.startupLog("entering per-source start loop for \(selectedSources.map(\.id))")
 
         let config = ModeConfig.config(for: subtitleMode)
         let recognitionHints = recognitionContextualStrings()
@@ -614,12 +679,14 @@ final class AppModel: ObservableObject {
             let sessionID = ObjectIdentifier(session)
 
             do {
+                Self.startupLog("starting source \(source.id)")
                 try await session.start(
                     source: source,
                     localeIdentifier: speechLocaleIdentifier(for: sourceLanguageID),
                     interfaceLanguageID: resolvedInterfaceLanguageID,
                     modeConfig: config,
                     contextualStrings: recognitionHints,
+                    cloudASR: cloudASR,
                     transcriptHandler: { [weak self] sentence in
                         self?.enqueueRecognizedSentence(
                             sentence,
@@ -637,6 +704,7 @@ final class AppModel: ObservableObject {
                         )
                     },
                     errorHandler: { [weak self] message in
+                        Self.startupLog("errorHandler fired: \(message)")
                         self?.sessionState = .error
                         self?.setStatus(.custom(message))
                         self?.overlayState = OverlayPreviewState(
@@ -659,6 +727,7 @@ final class AppModel: ObservableObject {
                         fatalSessionErrors.append((message, sessionID, source.name))
                     }
                 )
+                Self.startupLog("session.start returned for \(source.id)")
 
                 startedSessions.append(session)
                 startedSources.append(source)
@@ -701,6 +770,7 @@ final class AppModel: ObservableObject {
 
         isStartingSession = false
 
+        Self.startupLog("start loop done; started=\(startedSessions.count) failures=\(startupFailures.count)")
         if startedSessions.isEmpty == false {
             liveTranscriptionSessions = startedSessions
             liveTranscriptionSession = startedSessions.first
@@ -716,6 +786,7 @@ final class AppModel: ObservableObject {
             )
 
             sessionState = .running
+            Self.startupLog("state -> running")
             let activeSourceName = activeSourceDisplayName
             setStatus(.running(sourceName: activeSourceName))
 
@@ -874,10 +945,18 @@ final class AppModel: ObservableObject {
             overlayStyle: overlayStyle,
             subtitleMode: subtitleMode,
             subtitleDisplayMode: subtitleDisplayMode,
-            glossary: glossary
+            glossary: glossary,
+            cloudTranslation: cloudTranslation,
+            cloudASR: cloudASR
         )
 
         settingsStore.save(settings)
+        syncCloudTranslationSettings()
+    }
+
+    private func syncCloudTranslationSettings() {
+        translationCoordinator.cloudSettings = cloudTranslation
+        translationCoordinator.cloudGlossary = glossary
     }
 
     private static func normalizedOverlayStyle(_ style: OverlayStyle) -> OverlayStyle {
@@ -1123,7 +1202,9 @@ final class AppModel: ObservableObject {
     }
 
     private var hasBlockingLanguageResourceStatuses: Bool {
-        languageResourceStatuses.contains(where: \.isError)
+        languageResourceStatuses.contains { status in
+            status.isError && (cloudTranslation.enabled == false || status.kind != .translation)
+        }
     }
 
     private func prepareSelectedLanguageResources(
@@ -1133,7 +1214,7 @@ final class AppModel: ObservableObject {
     ) async {
         var destinationsToOpen = Set<LanguageResourceSystemSettingsDestination>()
         await withTaskGroup(of: LanguageResourceSystemSettingsDestination?.self) { group in
-            for speechLanguageID in speechLanguageIDs {
+            for speechLanguageID in speechLanguageIDs where cloudASR.enabled == false {
                 group.addTask { [weak self] in
                     guard let self else {
                         return nil
@@ -1143,7 +1224,7 @@ final class AppModel: ObservableObject {
                 }
             }
 
-            for translationPair in translationPairs {
+            for translationPair in translationPairs where cloudTranslation.enabled == false {
                 group.addTask { [weak self] in
                     guard let self else {
                         return nil

@@ -108,7 +108,7 @@ struct StatusBarPopoverView: View {
             SettingsControlRow(label: model.localized(.defaultInputLanguage)) {
                 CommonLanguageMenuPicker(
                     interfaceLanguageID: model.resolvedInterfaceLanguageID,
-                    options: model.speechLanguageOptions,
+                    options: LanguageCatalog.sourceOptions(cloudASREnabled: model.cloudASR.enabled),
                     selection: model.inputLanguageSelectionBinding
                 )
                 .disabled(model.isLanguagePairLocked)
@@ -122,7 +122,7 @@ struct StatusBarPopoverView: View {
             SettingsControlRow(label: model.localized(.defaultSubtitleLanguage)) {
                 CommonLanguageMenuPicker(
                     interfaceLanguageID: model.resolvedInterfaceLanguageID,
-                    options: model.translationLanguageOptions,
+                    options: LanguageCatalog.targetOptions(cloudTranslationEnabled: model.cloudTranslation.enabled),
                     selection: model.outputLanguageSelectionBinding
                 )
                 .disabled(model.isLanguagePairLocked)

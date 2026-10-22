@@ -398,7 +398,7 @@ extension AppModel {
             get: { self.inputLanguageID },
             set: {
                 guard self.isLanguagePairLocked == false else { return }
-                self.inputLanguageID = self.supportedSpeechInputLanguageID($0)
+                self.inputLanguageID = LanguageCatalog.supportedSpeechInputLanguageID(for: $0, cloudASREnabled: self.cloudASR.enabled)
             }
         )
     }
